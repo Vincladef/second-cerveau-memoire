@@ -131,6 +131,58 @@ async function handle(request) {
     return respond({ mode: vector ? "hybride" : "textuelle", model: MODEL, resultats: results, ...(warning ? { note: warning } : {}) });
   }
 
+
+  // Recherche sémantique sur toutes les tables du Second cerveau.
+  // Le point d'entrée /search historique reste compatible (souvenirs).
+  if (pathname === "/api/second-cerveau/search-all") {
+    const question = trimmed(payload.question, 6000);
+    if (!question) return respond({ error: "Question required" }, 400);
+    const count = limit(payload.limit);
+    let vector = null, warning;
+    try {
+      vector = await makeEmbedding(question);
+    } catch (error) {
+      warning = "Embedding unavailable; lexical fallback (" + String(error?.message).slice(0, 90) + ")";
+    }
+    const results = await sql.query(`
+      WITH lexical AS (
+        SELECT origine,cle,row_number() OVER (ORDER BY pertinence DESC) AS rang
+        FROM (
+          SELECT origine,cle,
+            ts_rank_cd(to_tsvector('french',texte),websearch_to_tsquery('french',$1::text)) AS pertinence
+          FROM public.memoire_index_semantique
+          WHERE actif AND to_tsvector('french',texte) @@ websearch_to_tsquery('french',$1::text)
+          ORDER BY pertinence DESC LIMIT 80
+        ) q
+      ),
+      semantique AS (
+        SELECT origine,cle,row_number() OVER (ORDER BY distance) AS rang
+        FROM (
+          SELECT origine,cle,embedding <=> $2::vector AS distance
+          FROM public.memoire_index_semantique
+          WHERE actif AND $2::vector IS NOT NULL AND embedding IS NOT NULL
+            AND embedding_modele='text-embedding-3-small'
+          ORDER BY embedding <=> $2::vector LIMIT 80
+        ) q
+      ),
+      fusion AS (
+        SELECT coalesce(s.origine,l.origine) AS origine,coalesce(s.cle,l.cle) AS cle,
+          (CASE WHEN s.rang IS NULL THEN 0.0 ELSE 0.65/(60.0+s.rang) END
+          + CASE WHEN l.rang IS NULL THEN 0.0 ELSE 0.35/(60.0+l.rang) END)::double precision AS score,
+          CASE WHEN s.rang IS NOT NULL AND l.rang IS NOT NULL THEN 'hybride'
+               WHEN s.rang IS NOT NULL THEN 'vectorielle' ELSE 'textuelle' END AS methode
+        FROM semantique s FULL OUTER JOIN lexical l USING(origine,cle)
+      )
+      SELECT f.origine,f.cle,i.texte,f.score,f.methode
+      FROM fusion f JOIN public.memoire_index_semantique i USING(origine,cle)
+      ORDER BY f.score DESC LIMIT $3::integer
+    `, [question,vector,count]);
+    return respond({
+      mode: vector ? "hybride" : "textuelle", couverture: "toutes_les_tables",
+      model: MODEL, resultats: results, ...(warning ? { note: warning } : {})
+    });
+  }
+
   if (pathname === "/api/second-cerveau/remember") {
     const contenu = trimmed(payload.contenu, MAX_TEXT);
     if (!contenu) return respond({ error: "Contenu required" }, 400);
