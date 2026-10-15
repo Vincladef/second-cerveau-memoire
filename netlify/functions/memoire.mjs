@@ -205,4 +205,4 @@ export const config = {
 };
 
 // Fonctions internes reutilisees par la tache de rattrapage planifiee.
-export { db, embedStoredMemory };
+export { db, embedStoredMemory, makeEmbedding };
