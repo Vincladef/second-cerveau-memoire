@@ -203,3 +203,6 @@ export default async function memoire(request) {
 export const config = {
   path: ["/api/second-cerveau", "/api/second-cerveau/*"]
 };
+
+// Fonctions internes reutilisees par la tache de rattrapage planifiee.
+export { db, embedStoredMemory };
