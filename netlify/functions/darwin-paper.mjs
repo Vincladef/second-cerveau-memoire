@@ -144,7 +144,7 @@ async function sendOrder(sql, strategyId, side, candle, params) {
   }
   await sql.query(
     "UPDATE darwin_engine_orders SET status=$2,broker_status=$2,broker_order_id=$3,updated_at=now() WHERE client_order_id=$1",
-    [id, order.status || "submitted", order.id]
+    [id, order.status === "filled" ? "filled_pending_sync" : (order.status || "submitted"), order.id]
   );
   if (order.status !== "filled") order = await getOrder(id) || order;
   if (order.status === "filled") {
@@ -176,6 +176,10 @@ async function run(sql, now) {
   if (!owned && num(brokerPosition?.qty_available) > 0) {
     return { action: "waiting", reason: "unowned_eth_position_preserved" };
   }
+  const strategyRows = await sql.query("SELECT id,genome FROM strategies WHERE id IN (23,24) AND status='paper_trial'");
+  const p23 = strategyRows.find((s) => Number(s.id) === 23)?.genome;
+  const p24 = strategyRows.find((s) => Number(s.id) === 24)?.genome;
+  if (!p23 || !p24) return { action: "waiting", reason: "inactive_strategy_genome" };
   const [m1, m5] = await Promise.all([getBars("1Min", now), getBars("5Min", now)]);
   if (m1.length < 6 || m5.length < 5) return { action: "waiting", reason: "insufficient_closed_bars" };
   const last1 = m1.at(-1), prev1 = m1.at(-2), last5 = m5.at(-1);
@@ -187,20 +191,24 @@ async function run(sql, now) {
     if (!(available > 0)) return { action: "waiting", reason: "position_reconciliation_required" };
     const r = num(last1.c) / num(owned.avg_fill_price) - 1;
     const ageMinutes = (now.getTime() - new Date(owned.acquired_at).getTime()) / 60000;
-    const closeIt = owned.strategy_id == 23
-      ? (r >= 0.009 || r <= -0.006 || (momentum5 <= 0 && ageMinutes >= 1) || ageMinutes >= 15)
-      : (r >= 0.009 || r <= -0.006 || ageMinutes >= 10);
+    const active = Number(owned.strategy_id) === 23 ? p23 : p24;
+    const target = Number(active.profit_target);
+    const stop = Number(active.stop_threshold);
+    const maxAge = Number(active.max_hold_minutes);
+    if (!(target > 0 && stop < 0 && maxAge > 0)) throw new Error("Invalid strategy exit parameters");
+    const closeIt = (r >= target || r <= stop || ageMinutes >= maxAge ||
+      (Number(owned.strategy_id) === 23 && momentum5 <= 0 && ageMinutes >= 1));
     if (!closeIt) return { action: "hold", strategy: owned.strategy_id };
     const quantity = roundDown(Math.min(available, held), 9);
     if (!(quantity > 0)) return { action: "waiting", reason: "no_sellable_quantity" };
     return sendOrder(sql, Number(owned.strategy_id), "sell", last1, { qty: String(quantity) });
   }
   let strategyId = null;
-  if (momentum5 > 0.0045) strategyId = 23;
-  else if (last5Return <= -0.006 && num(last1.c) > num(prev1.h)) strategyId = 24;
+  if (momentum5 > Number(p23.momentum_threshold)) strategyId = 23;
+  else if (last5Return <= Number(p24.reversion_trigger) && num(last1.c) > num(prev1.h)) strategyId = 24;
   if (!strategyId) return { action: "no_signal" };
   const cash = Math.min(num(account.cash), num(account.buying_power));
-  const notional = roundDown(cash - 0.01, 2);
+  const notional = roundDown(cash / 1.0025 - 0.01, 2); // reserve estimated broker fee, not a trading cap
   if (!(notional > 0)) return { action: "waiting", reason: "no_cash" };
   const asset = await broker("/v2/assets/ETHUSD");
   if (!asset.tradable) return { action: "waiting", reason: "asset_not_tradable" };
