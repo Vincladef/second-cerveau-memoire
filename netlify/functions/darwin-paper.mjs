@@ -210,13 +210,25 @@ async function run(sql, now) {
   return sendOrder(sql, strategyId, "buy", strategyId === 23 ? last5 : last1, { notional: String(notional) });
 }
 export default async function handler() {
-  if (env("DARWIN_TRADING_ENABLED") !== "true") {
+  const mode = env("DARWIN_TRADING_ENABLED");
+  if (mode !== "true" && mode !== "verify") {
     console.log("Darwin Paper executor staged but not activated.");
     return new Response(null, { status: 204 });
   }
   const connection = env("DARWIN_DATABASE_URL");
   if (!connection || !/\/darwin_trading_lab(?:\?|$)/.test(connection)) throw new Error("Wrong Neon database: refuse trading");
   const sql = neon(connection);
+  if (mode === "verify") {
+    const [account, dbCheck] = await Promise.all([
+      broker("/v2/account"),
+      sql.query("SELECT COUNT(*)::int AS n FROM strategies WHERE status='paper_trial' AND id IN (23,24)"),
+    ]);
+    if (account.status !== "ACTIVE" || account.trading_blocked || Number(dbCheck[0]?.n) !== 2) {
+      throw new Error("Darwin read-only verification failed");
+    }
+    console.log("DARWIN_VERIFY_OK: Paper account accessible; Darwin strategies 23 and 24 accessible; orders disabled");
+    return new Response(null, { status: 204 });
+  }
   const now = new Date();
   const tick = isoMinute(now);
   const claimed = await sql.query(
